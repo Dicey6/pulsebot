@@ -13,8 +13,8 @@ trading simulator.
     - No transactions are ever signed.
     - No real SOL is ever spent.
     Every "trade" is a simulation that uses LIVE market data from
-    DexScreener to calculate realistic hypothetical outcomes, tracked in a
-    local JSON "demo wallet" per Telegram user.
+    Helius API (primary) and DexScreener (fallback) to calculate realistic
+    hypothetical outcomes, tracked in a local JSON "demo wallet" per user.
 
 Tech stack: python-telegram-bot (v21+), httpx, python-dotenv, Pillow, JSON
 storage. Single file, designed to run as a Render background worker via
@@ -84,6 +84,10 @@ _HARDCODED_FALLBACK_TOKEN = "8638344989:AAH3bfBni5GN3oWUBoVerKIMzND0-8goi3I"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "") or _HARDCODED_FALLBACK_TOKEN
 BOT_USERNAME = "@pulsesolanabot"
 
+# Helius API Key (hardcoded as requested)
+_HELIUS_API_KEY = "d5381285-5b00-4ad2-9255-581b5e55e2cc"
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "") or _HELIUS_API_KEY
+
 DB_PATH = Path(os.getenv("DB_PATH", "db.json"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -96,6 +100,8 @@ POSITIONS_PER_PAGE = 3
 HISTORY_PER_PAGE = 6
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
+HELIUS_PRICE_URL = "https://api.helius.xyz/v0/token-price"
+HELIUS_DAS_URL = "https://api.helius.xyz/v0/assets"
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 SOL_ADDRESS_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
@@ -200,6 +206,23 @@ def fmt_num(n: float) -> str:
     return f"{sign}${n:,.2f}"
 
 
+def fmt_num_plain(n: float) -> str:
+    """Compact number without $ sign: 1234 -> 1.23K, 1_500_000 -> 1.5M"""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "N/A"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000_000:
+        return f"{sign}{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{sign}{n / 1_000:.2f}K"
+    return f"{sign}{n:,.2f}"
+
+
 def fmt_price(n: Optional[float]) -> str:
     if n is None:
         return "N/A"
@@ -237,6 +260,7 @@ def fmt_pct(n: Optional[float]) -> str:
         return "N/A"
     arrow = "🟢▲" if n > 0 else ("🔴▼" if n < 0 else "⚪")
     return f"{arrow} {n:+.2f}%"
+
 
 def fmt_pct_plain(n: Optional[float]) -> str:
     if n is None:
@@ -286,13 +310,112 @@ def md_escape(text: str) -> str:
 
 
 # =============================================================================
-# DEXSCREENER API
+# HELIUS API INTEGRATION
 # =============================================================================
 
 _sol_price_cache: dict[str, Any] = {"price": 150.0, "ts": 0.0}
+_token_cache: dict[str, dict[str, Any]] = {}
+_cache_ttl = 30  # seconds
 
 
-async def fetch_pairs(contract_address: str) -> list[dict] | None:
+async def fetch_token_helius(contract_address: str) -> dict[str, Any] | None:
+    """Fetch token data from Helius API (price + metadata)."""
+    try:
+        # Get price data
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            price_url = f"{HELIUS_PRICE_URL}?api-key={HELIUS_API_KEY}&mint={contract_address}"
+            resp = await client.get(price_url, headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            price_data = resp.json()
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.warning("Helius price fetch failed for %s: %s", contract_address, e)
+        return None
+
+    # Parse price response
+    price_info = None
+    if price_data.get("data") and len(price_data["data"]) > 0:
+        price_info = price_data["data"][0]
+
+    if not price_info:
+        return None
+
+    try:
+        price_usd = float(price_info.get("price", 0))
+        mc = float(price_info.get("marketCap", 0))
+        volume_24h = float(price_info.get("volume24h", 0))
+        change_24h = float(price_info.get("priceChange24h", 0))
+    except (TypeError, ValueError):
+        return None
+
+    # Get metadata from DAS
+    name, symbol, decimals, supply, created_at, logo_url = await fetch_token_metadata_helius(contract_address)
+
+    return {
+        "address": contract_address,
+        "name": name or "Unknown",
+        "symbol": symbol or "???",
+        "price_usd": price_usd,
+        "mc": mc,
+        "volume_24h": volume_24h,
+        "change_h24": change_24h,
+        "liquidity_usd": None,  # Helius doesn't provide this
+        "decimals": decimals,
+        "total_supply": supply,
+        "created_at": created_at,
+        "logo_url": logo_url,
+        "source": "helius",
+        "fetched_at": now_ts(),
+    }
+
+
+async def fetch_token_metadata_helius(contract_address: str) -> tuple[Optional[str], Optional[str], Optional[int], Optional[float], Optional[float], Optional[str]]:
+    """Fetch token metadata from Helius DAS API."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            url = f"{HELIUS_DAS_URL}?api-key={HELIUS_API_KEY}&ids={contract_address}"
+            resp = await client.get(url, headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("Helius DAS fetch failed for %s: %s", contract_address, e)
+        return None, None, None, None, None, None
+
+    if not data.get("data") or len(data["data"]) == 0:
+        return None, None, None, None, None, None
+
+    asset = data["data"][0]
+    content = asset.get("content", {})
+    metadata = content.get("metadata", {})
+    
+    name = metadata.get("name")
+    symbol = metadata.get("symbol")
+    
+    # Get decimals from token_info
+    token_info = asset.get("token_info", {})
+    decimals = token_info.get("decimals")
+    supply = token_info.get("supply")
+    
+    # Created at - try to parse from mint extensions or use current time
+    created_at = None
+    # Try to get from various possible fields
+    if asset.get("created_at"):
+        try:
+            created_at = float(asset["created_at"])
+        except (TypeError, ValueError):
+            pass
+    
+    # Logo URL
+    logo_url = None
+    if content.get("links", {}).get("image"):
+        logo_url = content["links"]["image"]
+    elif metadata.get("image"):
+        logo_url = metadata["image"]
+    
+    return name, symbol, decimals, supply, created_at, logo_url
+
+
+async def fetch_token_dexscreener(contract_address: str) -> dict[str, Any] | None:
+    """Fetch token data from DexScreener (fallback)."""
     url = DEXSCREENER_TOKENS_URL.format(contract_address)
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -302,65 +425,91 @@ async def fetch_pairs(contract_address: str) -> list[dict] | None:
     except (httpx.HTTPError, ValueError) as e:
         logger.warning("DexScreener fetch failed for %s: %s", contract_address, e)
         return None
+    
     pairs = data.get("pairs") or []
     sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-    return sol_pairs or pairs or None
-
-
-async def fetch_token(contract_address: str) -> dict[str, Any] | None:
-    """Fetch and normalize the best (highest-liquidity) pair for a token."""
-    pairs = await fetch_pairs(contract_address)
+    pairs = sol_pairs or pairs
     if not pairs:
         return None
+    
     best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
-
+    
     price_change = best.get("priceChange") or {}
     volume = best.get("volume") or {}
     liquidity = best.get("liquidity") or {}
     base = best.get("baseToken") or {}
-
+    
     try:
         price_usd = float(best.get("priceUsd") or 0)
     except (TypeError, ValueError):
         price_usd = 0.0
-
+    
     return {
         "address": base.get("address", contract_address),
         "name": base.get("name", "Unknown"),
         "symbol": base.get("symbol", "???"),
         "price_usd": price_usd,
-        "price_native": best.get("priceNative"),
         "mc": best.get("marketCap") or best.get("fdv"),
-        "fdv": best.get("fdv"),
-        "liquidity_usd": liquidity.get("usd", 0) or 0,
         "volume_24h": volume.get("h24", 0) or 0,
-        "change_m5": price_change.get("m5"),
-        "change_h1": price_change.get("h1"),
-        "change_h6": price_change.get("h6"),
         "change_h24": price_change.get("h24"),
-        "dex_id": best.get("dexId", "unknown"),
-        "pair_url": best.get("url", f"https://dexscreener.com/solana/{contract_address}"),
-        "pair_address": best.get("pairAddress"),
+        "liquidity_usd": liquidity.get("usd", 0) or 0,
+        "decimals": None,
+        "total_supply": None,
+        "created_at": None,
+        "logo_url": None,
+        "source": "dexscreener",
         "fetched_at": now_ts(),
     }
 
 
+async def fetch_token(contract_address: str, force_refresh: bool = False) -> dict[str, Any] | None:
+    """Fetch token data: try Helius first, fallback to DexScreener."""
+    # Check cache
+    cache_key = contract_address
+    if not force_refresh and cache_key in _token_cache:
+        cached = _token_cache[cache_key]
+        if now_ts() - cached.get("fetched_at", 0) < _cache_ttl:
+            return cached
+    
+    # Try Helius
+    token = await fetch_token_helius(contract_address)
+    if token:
+        _token_cache[cache_key] = token
+        return token
+    
+    # Fallback to DexScreener
+    logger.info("Helius failed for %s, falling back to DexScreener", contract_address)
+    token = await fetch_token_dexscreener(contract_address)
+    if token:
+        _token_cache[cache_key] = token
+        return token
+    
+    return None
+
+
 async def get_sol_price_usd() -> float:
-    """Cached SOL/USD price, refreshed every 60s. Used for quantity/impact estimates only."""
+    """Cached SOL/USD price, refreshed every 60s."""
     if now_ts() - _sol_price_cache["ts"] < 60:
         return _sol_price_cache["price"]
-    token = await fetch_token(SOL_MINT)
+    
+    # Try Helius first
+    token = await fetch_token_helius(SOL_MINT)
     if token and token["price_usd"]:
         _sol_price_cache["price"] = token["price_usd"]
         _sol_price_cache["ts"] = now_ts()
+        return _sol_price_cache["price"]
+    
+    # Fallback to DexScreener
+    token = await fetch_token_dexscreener(SOL_MINT)
+    if token and token["price_usd"]:
+        _sol_price_cache["price"] = token["price_usd"]
+        _sol_price_cache["ts"] = now_ts()
+    
     return _sol_price_cache["price"]
 
 
 # =============================================================================
 # PNL CARD IMAGE GENERATION (Pillow)
-# Premium 1920x1080 dark / purple-neon / glassmorphism card, built for
-# sharing closed positions on X. Fonts ship in fonts/ so rendering is
-# identical on Render regardless of what's installed on the host.
 # =============================================================================
 
 _FONT_CACHE: dict[tuple[str, int], ImageFont.FreeTypeFont] = {}
@@ -368,9 +517,7 @@ _LOGO_CACHE: dict[int, Optional[Image.Image]] = {}
 
 
 def _load_logo(target_size: int) -> Optional[Image.Image]:
-    """Loads assets/pulse_logo.png resized to a square of target_size px.
-    Returns None if the asset is missing so the card still renders (brand
-    text alone) without crashing."""
+    """Loads assets/pulse_logo.png resized to a square of target_size px."""
     if target_size in _LOGO_CACHE:
         return _LOGO_CACHE[target_size]
     path = ASSETS_DIR / "pulse_logo.png"
@@ -398,8 +545,8 @@ def _load_font(size: int, bold: bool = False, mono: bool = False) -> ImageFont.F
         "DejaVuSans.ttf"
     )
     candidates = [
-        FONTS_DIR / filename,                                   # bundled project font (preferred)
-        Path("/usr/share/fonts/truetype/dejavu") / filename,     # system fallback
+        FONTS_DIR / filename,
+        Path("/usr/share/fonts/truetype/dejavu") / filename,
     ]
     font = None
     for path in candidates:
@@ -446,10 +593,6 @@ def generate_pnl_card(
     Renders a premium, shareable PNL card (1920x1080) — dark background,
     purple neon accents, glassmorphism panel — for a closed position
     (or an open one, if is_unrealized=True, used by the Share button).
-
-    Shows only: token name/symbol, shortened CA, buy mcap, sell mcap,
-    hold time, amount invested (SOL), amount returned (SOL), PnL % and
-    PnL (SOL). Green styling for profit, red for loss.
     """
     W, H = 1920, 1080
     win = pnl_pct >= 0
@@ -469,7 +612,7 @@ def generate_pnl_card(
                   _lerp(top_color[2], bottom_color[2], t), 255),
         )
 
-    # ---- Ambient neon glow blobs (purple + green/red accent) ----
+    # ---- Ambient neon glow blobs ----
     glow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow_layer)
     gd.ellipse([-260, -340, 780, 480], fill=NEON_PURPLE + (70,))
@@ -478,7 +621,7 @@ def generate_pnl_card(
     glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(180))
     base.alpha_composite(glow_layer)
 
-    # ---- Soft vignette for depth (premium fintech feel) ----
+    # ---- Soft vignette ----
     vignette = Image.new("L", (W, H), 0)
     vd = ImageDraw.Draw(vignette)
     vd.ellipse([-W * 0.25, -H * 0.35, W * 1.25, H * 1.35], fill=255)
@@ -487,7 +630,7 @@ def generate_pnl_card(
     vignette_layer.putalpha(Image.eval(vignette, lambda p: 130 - int(p / 255 * 130)))
     base.alpha_composite(vignette_layer)
 
-    # ---- Faint grid texture for a fintech-dashboard feel ----
+    # ---- Faint grid texture ----
     grid_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     gd2 = ImageDraw.Draw(grid_layer)
     for gx in range(0, W, 64):
@@ -512,7 +655,7 @@ def generate_pnl_card(
     f_value = _load_font(32, bold=True)
     f_footer = _load_font(22)
 
-    # ---- Header: logo + brand (left) + @handle (right) ----
+    # ---- Header: logo + brand ----
     logo = _load_logo(46)
     brand_x = pad
     if logo is not None:
@@ -522,7 +665,7 @@ def generate_pnl_card(
     handle_w = _text_w(draw, BOT_USERNAME, f_handle)
     draw.text((W - pad - handle_w, 62), BOT_USERNAME, font=f_handle, fill=(150, 145, 165))
 
-    # ---- Status badge: PROFIT / LOSS pill, glassy with neon border ----
+    # ---- Status badge ----
     if is_unrealized:
         badge_text = "🟩 UNREALIZED PROFIT" if win else "🟥 UNREALIZED LOSS"
     else:
@@ -537,7 +680,7 @@ def generate_pnl_card(
     draw = ImageDraw.Draw(base)
     draw.text(((bx0 + bx1) / 2, (by0 + by1) / 2), badge_text, font=f_badge, fill=accent, anchor="mm")
 
-    # ---- Main glassmorphism panel (with soft drop shadow behind it) ----
+    # ---- Main glassmorphism panel ----
     panel_box = [pad, 190, W - pad, H - 90]
     shadow_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     sd = ImageDraw.Draw(shadow_layer)
@@ -552,7 +695,7 @@ def generate_pnl_card(
     pd.rounded_rectangle(panel_box, radius=40, fill=(255, 255, 255, 14))
     base.alpha_composite(panel_layer)
 
-    # Subtle top-lit sheen: a soft light band across the upper part of the panel
+    # Subtle top-lit sheen
     sheen_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     shd = ImageDraw.Draw(sheen_layer)
     shd.rounded_rectangle(panel_box, radius=40, fill=(255, 255, 255, 0))
@@ -563,7 +706,7 @@ def generate_pnl_card(
     sheen_layer.putalpha(Image.composite(sheen_layer.split()[3], Image.new("L", (W, H), 0), sheen_mask))
     base.alpha_composite(sheen_layer)
 
-    # Glowing neon border (blurred pass behind a sharp pass = neon glow effect)
+    # Glowing neon border
     border_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     bgd = ImageDraw.Draw(border_layer)
     bgd.rounded_rectangle(panel_box, radius=40, outline=accent + (220,), width=3)
@@ -572,7 +715,7 @@ def generate_pnl_card(
 
     draw = ImageDraw.Draw(base)
 
-    # ---- Token identity (top-left inside panel) ----
+    # ---- Token identity ----
     ix, iy = pad + 60, 240
     draw.text((ix, iy), f"${symbol.upper()}", font=f_symbol, fill=(255, 255, 255))
     iy += 110
@@ -580,7 +723,7 @@ def generate_pnl_card(
     iy += 44
     draw.text((ix, iy), f"CA: {short_addr(contract_address)}", font=f_ca, fill=NEON_PURPLE)
 
-    # ---- Big centered PnL % with neon glow + trend arrow ----
+    # ---- Big centered PnL % ----
     pct_text = f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%"
     cy = 470
     glow_text = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -592,7 +735,7 @@ def generate_pnl_card(
     draw = ImageDraw.Draw(base)
     draw.text((px0, cy), pct_text, font=f_pnl_pct, fill=accent_soft)
 
-    # Small trend triangle to the left of the percentage
+    # Small trend triangle
     tri_cx, tri_cy = px0 - 55, cy + 95
     tri_size = 34
     if win:
@@ -603,7 +746,7 @@ def generate_pnl_card(
                     (tri_cx + tri_size / 2, tri_cy + tri_size / 2)]
     draw.polygon(triangle, fill=accent)
 
-    # ---- PnL in SOL, centered below ----
+    # ---- PnL in SOL ----
     sol_text = f"{'+' if pnl_sol >= 0 else ''}{pnl_sol:.4f} SOL"
     _draw_centered(draw, W / 2, 700, sol_text, f_pnl_sol, (232, 230, 240))
 
@@ -611,7 +754,7 @@ def generate_pnl_card(
     div_y = 800
     draw.line([(pad + 60, div_y), (W - pad - 60, div_y)], fill=(255, 255, 255, 35), width=2)
 
-    # ---- Stat chips: Buy MCAP / Sell MCAP / Hold Time / Invested / Returned ----
+    # ---- Stat chips ----
     stats = [
         ("BUY MCAP", fmt_num(buy_mcap) if buy_mcap else "N/A"),
         ("CURRENT MCAP" if is_unrealized else "SELL MCAP", fmt_num(sell_mcap) if sell_mcap else "N/A"),
@@ -688,11 +831,17 @@ def kb_token(ca: str, has_position: bool) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton("🔄 Refresh", callback_data=f"tok:{ca}"),
-        InlineKeyboardButton("📊 Chart", url=f"https://dexscreener.com/solana/{ca}"),
+        InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/solana/{ca}"),
+        InlineKeyboardButton("📋 Copy CA", callback_data=f"copy:{ca}"),
     ])
     rows.append([
-        InlineKeyboardButton("🌐 Explorer", url=f"https://solscan.io/token/{ca}"),
-        InlineKeyboardButton("🔎 Scan", url=f"https://rugcheck.xyz/tokens/{ca}"),
+        InlineKeyboardButton("🌐 Solscan", url=f"https://solscan.io/token/{ca}"),
+        InlineKeyboardButton("🔎 Rugcheck", url=f"https://rugcheck.xyz/tokens/{ca}"),
+        InlineKeyboardButton("🦅 Birdeye", url=f"https://birdeye.so/token/{ca}?chain=solana"),
+    ])
+    rows.append([
+        InlineKeyboardButton("📡 Photon", url=f"https://photon-sol.trade/token/{ca}"),
+        InlineKeyboardButton("📈 GMGN", url=f"https://gmgn.ai/sol/token/{ca}"),
     ])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -702,18 +851,19 @@ def kb_positions(page: int, total_pages: int, cas_on_page: list[str]) -> InlineK
     rows = []
     for ca in cas_on_page:
         rows.append([
-            InlineKeyboardButton(f"📂 Open {short_addr(ca)}", callback_data=f"tok:{ca}"),
+            InlineKeyboardButton(f"📂 {short_addr(ca)}", callback_data=f"tok:{ca}"),
+            InlineKeyboardButton("🔄", callback_data=f"refpos:{ca}"),
+            InlineKeyboardButton("📤", callback_data=f"shr:{ca}"),
         ])
         rows.append([
             InlineKeyboardButton("25%", callback_data=f"s25:{ca}"),
             InlineKeyboardButton("50%", callback_data=f"s50:{ca}"),
             InlineKeyboardButton("All", callback_data=f"s100:{ca}"),
-            InlineKeyboardButton("📤", callback_data=f"shr:{ca}"),
         ])
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"positions:{page - 1}"))
-    nav.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"positions:{page}"))
+    nav.append(InlineKeyboardButton("🔄 Refresh All", callback_data=f"positions:{page}"))
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"positions:{page + 1}"))
     rows.append(nav)
@@ -786,7 +936,6 @@ async def execute_buy(user: dict, ca: str, token: dict, sol_amount: float) -> di
 
     pos = user["positions"].get(ca)
     if pos:
-        # Average in (price and mcap both weighted by position size)
         total_qty = pos["quantity"] + qty
         total_invested = pos["invested_sol"] + sol_amount
         pos["entry_price"] = (
@@ -934,6 +1083,9 @@ def portfolio_stats(user: dict, current_prices: dict[str, float]) -> dict:
     avg_hold = sum(hold_times) / len(hold_times) if hold_times else 0.0
 
     avg_return = sum(t["pnl_pct"] for t in sells) / len(sells) if sells else 0.0
+    
+    total_pnl = user.get("realized_pnl", 0.0) + unrealized
+    total_pnl_pct = (total_pnl / invested_capital * 100) if invested_capital > 0 else 0.0
 
     return {
         "portfolio_value": portfolio_value,
@@ -942,6 +1094,8 @@ def portfolio_stats(user: dict, current_prices: dict[str, float]) -> dict:
         "open_positions": len(user["positions"]),
         "unrealized_pnl": unrealized,
         "realized_pnl": user.get("realized_pnl", 0.0),
+        "total_pnl": total_pnl,
+        "total_pnl_pct": total_pnl_pct,
         "daily_profit": daily,
         "weekly_profit": weekly,
         "monthly_profit": monthly,
@@ -979,6 +1133,7 @@ async def build_home_text(user: dict) -> str:
         f"📂 Open Positions: `{stats['open_positions']}`",
         f"📈 Unrealized PnL: `{'+' if stats['unrealized_pnl'] >= 0 else ''}{fmt_sol(stats['unrealized_pnl'])} SOL`",
         f"✅ Realized PnL: `{'+' if stats['realized_pnl'] >= 0 else ''}{fmt_sol(stats['realized_pnl'])} SOL`",
+        f"📊 Total PnL: `{'+' if stats['total_pnl'] >= 0 else ''}{fmt_sol(stats['total_pnl'])} SOL` ({stats['total_pnl_pct']:+.2f}%)",
         f"🏆 Win Rate: `{stats['win_rate']:.1f}%`",
         "",
         "_Paste any Solana contract address to instantly pull up a token._",
@@ -990,35 +1145,44 @@ async def build_token_text(ca: str, token: dict, user: dict) -> str:
     pos = user["positions"].get(ca)
     default_buy = user.get("default_buy", DEFAULT_BUY_AMOUNT)
 
-    impact = "N/A"
+    # Calculate max buy based on liquidity (if available)
+    max_buy = "N/A"
     if token.get("liquidity_usd"):
         sol_usd = await get_sol_price_usd()
-        usd_amt = default_buy * sol_usd
-        try:
-            impact_pct = (usd_amt / token["liquidity_usd"]) * 100
-            impact = f"~{impact_pct:.2f}%"
-        except ZeroDivisionError:
-            impact = "N/A"
+        max_buy_sol = (token["liquidity_usd"] * 0.01) / sol_usd if sol_usd > 0 else 0
+        max_buy = fmt_sol(max_buy_sol)
 
     lines = [
         f"🟢 *Buy* `${md_escape(token['symbol'])}`",
         f"_{md_escape(token['name'])}_",
         "",
         f"📄 `{ca}`",
-        f"[Explorer](https://solscan.io/token/{ca}) • [Chart]({token['pair_url']}) • [Scan](https://rugcheck.xyz/tokens/{ca})",
+        f"[Solscan](https://solscan.io/token/{ca}) • [DexScreener](https://dexscreener.com/solana/{ca}) • [Rugcheck](https://rugcheck.xyz/tokens/{ca})",
         "",
         f"💵 Price: `{fmt_price(token['price_usd'])}`",
-        f"⏱ 5m: {fmt_pct(token['change_m5'])}   1h: {fmt_pct(token['change_h1'])}",
-        f"⏱ 6h: {fmt_pct(token['change_h6'])}   24h: {fmt_pct(token['change_h24'])}",
-        "",
-        f"💧 Liquidity: `{fmt_num(token['liquidity_usd'])}`",
         f"🏦 Market Cap: `{fmt_num(token['mc'])}`",
-        f"📊 FDV: `{fmt_num(token['fdv'])}`",
         f"📈 Volume 24h: `{fmt_num(token['volume_24h'])}`",
-        f"⚡ Price Impact (@ {fmt_sol(default_buy)} SOL): `{impact}`",
+        f"⏱ 24h Change: {fmt_pct(token['change_h24'])}",
+    ]
+    
+    # Add metadata from Helius if available
+    if token.get("decimals") is not None:
+        lines.append(f"🔢 Decimals: `{token['decimals']}`")
+    if token.get("total_supply"):
+        lines.append(f"📊 Total Supply: `{fmt_num_plain(token['total_supply'])}`")
+    if token.get("created_at"):
+        created = datetime.fromtimestamp(token['created_at'], tz=timezone.utc)
+        days_ago = (datetime.now(timezone.utc) - created).days
+        lines.append(f"📅 Created: `{created.strftime('%Y-%m-%d')}` ({days_ago}d ago)")
+    if token.get("liquidity_usd"):
+        lines.append(f"💧 Liquidity: `{fmt_num(token['liquidity_usd'])}`")
+        if max_buy != "N/A":
+            lines.append(f"⚡ Max Buy (1% slip): `{max_buy} SOL`")
+    
+    lines.extend([
         "",
         f"👛 Demo Wallet Balance: `{fmt_sol(user['balance'])} SOL`",
-    ]
+    ])
 
     if pos:
         cur_ratio = (token["price_usd"] / pos["entry_price"]) if pos["entry_price"] else 1.0
@@ -1031,30 +1195,60 @@ async def build_token_text(ca: str, token: dict, user: dict) -> str:
             f"{emoji} *Current Position*",
             f"Quantity: `{pos['quantity']:,.2f}`",
             f"Entry Price: `{fmt_price(pos['entry_price'])}`",
+            f"Entry MCAP: `{fmt_num(pos.get('entry_mcap'))}`",
             f"Invested: `{fmt_sol(pos['invested_sol'])} SOL`",
             f"Current Value: `{fmt_sol(cur_val)} SOL`",
             f"PnL: {fmt_pct(pnl_pct)} (`{'+' if pnl_sol >= 0 else ''}{fmt_sol(pnl_sol)} SOL`)",
         ]
 
-    lines += ["", f"🕒 Last Updated: {fmt_time_ago(token['fetched_at'])}"]
+    lines += ["", f"🕒 Data Source: `{token.get('source', 'unknown')}`"]
     return "\n".join(lines)
 
 
-def build_positions_text(user: dict, page: int, prices: dict[str, float]) -> tuple[str, list[str], int]:
+def build_positions_text(user: dict, page: int, prices: dict[str, float], mcaps: dict[str, float]) -> tuple[str, list[str], int]:
     cas = list(user["positions"].keys())
     total_pages = max(1, (len(cas) + POSITIONS_PER_PAGE - 1) // POSITIONS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     page_cas = cas[page * POSITIONS_PER_PAGE:(page + 1) * POSITIONS_PER_PAGE]
 
-    header = [f"{BRAND}", "📈 *Open Positions* — Trading Terminal", ""]
+    # Calculate total PnL for header
+    total_unrealized = 0.0
+    total_invested = 0.0
+    for ca in cas:
+        pos = user["positions"][ca]
+        price = prices.get(ca)
+        if price and pos["entry_price"]:
+            ratio = price / pos["entry_price"]
+        else:
+            ratio = 1.0
+        total_unrealized += pos["invested_sol"] * ratio - pos["invested_sol"]
+        total_invested += pos["invested_sol"]
+    
+    total_pnl_pct = (total_unrealized / total_invested * 100) if total_invested > 0 else 0.0
+
+    header = [
+        f"{BRAND}",
+        "📈 *Open Positions* — Trading Terminal",
+        f"📊 Total Unrealized: `{'+' if total_unrealized >= 0 else ''}{fmt_sol(total_unrealized)} SOL` ({total_pnl_pct:+.2f}%)",
+        f"📂 Positions: `{len(cas)}`",
+        "",
+    ]
+    
     if not cas:
         header.append("_You have no open positions. Paste a contract address to get started._")
         return "\n".join(header), [], total_pages
 
     body = []
-    for ca in page_cas:
+    # Sort by PnL % (highest first)
+    sorted_cas = sorted(page_cas, key=lambda ca: (
+        ((prices.get(ca, 0) / user["positions"][ca]["entry_price"]) - 1) if user["positions"][ca]["entry_price"] else -999,
+    ), reverse=True)
+    
+    for ca in sorted_cas:
         pos = user["positions"][ca]
         price = prices.get(ca)
+        mcap = mcaps.get(ca)
+        
         if price and pos["entry_price"]:
             ratio = price / pos["entry_price"]
         else:
@@ -1064,15 +1258,20 @@ def build_positions_text(user: dict, page: int, prices: dict[str, float]) -> tup
         pnl_pct = (ratio - 1) * 100
         emoji = "🟩" if pnl_pct >= 0 else "🟥"
         hold = fmt_duration(now_ts() - pos["entry_time"])
+        
+        entry_mcap = pos.get("entry_mcap")
+        current_mcap = mcap
 
         block = [
             f"{emoji} *${md_escape(pos['symbol'])}* — {md_escape(pos['name'])}",
-            f"`{short_addr(ca)}`",
-            f"Entry: `{fmt_price(pos['entry_price'])}`  Current: `{fmt_price(price)}`",
-            f"Invested: `{fmt_sol(pos['invested_sol'])} SOL`  Value: `{fmt_sol(cur_val)} SOL`",
-            f"Qty: `{pos['quantity']:,.2f}`  Hold: `{hold}`",
-            f"PnL: {fmt_pct(pnl_pct)} (`{'+' if pnl_sol >= 0 else ''}{fmt_sol(pnl_sol)} SOL`)",
-            "─" * 24,
+            f"📄 `{short_addr(ca)}`",
+            "",
+            f"📊 MCAP: {fmt_num(entry_mcap) if entry_mcap else 'N/A'} → {fmt_num(current_mcap) if current_mcap else 'N/A'}  ({pnl_pct:+.2f}%)",
+            f"💰 Invested: `{fmt_sol(pos['invested_sol'])} SOL`  💰 Value: `{fmt_sol(cur_val)} SOL`",
+            f"📦 Qty: `{pos['quantity']:,.2f}`  ⏱ Hold: `{hold}`",
+            "",
+            f"📈 PnL: {fmt_pct(pnl_pct)} (`{'+' if pnl_sol >= 0 else ''}{fmt_sol(pnl_sol)} SOL`)",
+            "──────────────────────",
         ]
         body.extend(block)
 
@@ -1096,6 +1295,7 @@ def build_portfolio_text(user: dict, stats: dict) -> str:
         "",
         f"📈 Unrealized Profit: `{'+' if stats['unrealized_pnl']>=0 else ''}{fmt_sol(stats['unrealized_pnl'])} SOL`",
         f"✅ Realized Profit: `{'+' if stats['realized_pnl']>=0 else ''}{fmt_sol(stats['realized_pnl'])} SOL`",
+        f"📊 Total PnL: `{'+' if stats['total_pnl']>=0 else ''}{fmt_sol(stats['total_pnl'])} SOL` ({stats['total_pnl_pct']:+.2f}%)",
         f"🗓 Daily Profit: `{'+' if stats['daily_profit']>=0 else ''}{fmt_sol(stats['daily_profit'])} SOL`",
         f"🗓 Weekly Profit: `{'+' if stats['weekly_profit']>=0 else ''}{fmt_sol(stats['weekly_profit'])} SOL`",
         f"🗓 Monthly Profit: `{'+' if stats['monthly_profit']>=0 else ''}{fmt_sol(stats['monthly_profit'])} SOL`",
@@ -1180,6 +1380,28 @@ async def safe_edit(query, text: str, reply_markup=None, disable_preview=True):
                 pass
 
 
+async def send_token_logo(context: ContextTypes.DEFAULT_TYPE, chat_id: int, token: dict):
+    """Send token logo as a photo if available."""
+    logo_url = token.get("logo_url")
+    if not logo_url:
+        return
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(logo_url)
+            resp.raise_for_status()
+            photo = io.BytesIO(resp.content)
+            photo.name = f"{token['symbol']}_logo.png"
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=f"🪙 *{md_escape(token['symbol'])}* logo",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    except Exception as e:
+        logger.warning("Failed to send token logo: %s", e)
+
+
 # =============================================================================
 # HANDLERS
 # =============================================================================
@@ -1195,21 +1417,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def show_token_screen(query, context, ca: str):
+async def show_token_screen(query, context, ca: str, force_refresh: bool = False):
     db = load_db()
     user = get_user(db, query.from_user.id)
-    token = await fetch_token(ca)
+    token = await fetch_token(ca, force_refresh=force_refresh)
     if not token:
         await safe_edit(
             query,
             f"{BRAND}\n\n⚠️ Could not fetch data for this token.\n"
-            f"`{ca}`\n\nIt may be invalid, unlisted, or DexScreener is temporarily unavailable.",
+            f"`{ca}`\n\nIt may be invalid, unlisted, or both Helius and DexScreener are temporarily unavailable.",
             reply_markup=kb_back("home"),
         )
         return
     context.user_data["last_ca"] = ca
     text = await build_token_text(ca, token, user)
     has_pos = ca in user["positions"]
+    
+    # Send logo if available
+    if token.get("logo_url"):
+        await send_token_logo(context, query.message.chat_id, token)
+    
     await safe_edit(query, text, reply_markup=kb_token(ca, has_pos))
 
 
@@ -1217,11 +1444,13 @@ async def show_positions_screen(query, context, page: int):
     db = load_db()
     user = get_user(db, query.from_user.id)
     prices = {}
+    mcaps = {}
     for ca in user["positions"]:
         t = await fetch_token(ca)
         if t:
             prices[ca] = t["price_usd"]
-    text, page_cas, total_pages = build_positions_text(user, page, prices)
+            mcaps[ca] = t.get("mc")
+    text, page_cas, total_pages = build_positions_text(user, page, prices, mcaps)
     await safe_edit(query, text, reply_markup=kb_positions(page, total_pages, page_cas))
 
 
@@ -1272,6 +1501,7 @@ async def do_buy(query, context, ca: str, sol_amount: float):
         f"Token: `${md_escape(token['symbol'])}` — {md_escape(token['name'])}\n"
         f"Quantity: `{trade['quantity']:,.2f}`\n"
         f"Entry Price: `{fmt_price(trade['price'])}`\n"
+        f"Entry MCAP: `{fmt_num(trade.get('mcap'))}`\n"
         f"Invested: `{fmt_sol(trade['sol_amount'])} SOL`\n\n"
         f"👛 Remaining Balance: `{fmt_sol(user['balance'])} SOL`\n"
         f"📊 Portfolio Value: `{fmt_sol(stats['portfolio_value'])} SOL`\n"
@@ -1300,16 +1530,23 @@ async def do_sell(query, context, ca: str, fraction: float):
         return
     save_db(db)
 
-    remaining_prices = {c: (await fetch_token(c))["price_usd"] for c in user["positions"]} if user["positions"] else {}
+    remaining_prices = {}
+    remaining_mcaps = {}
+    for c in user["positions"]:
+        t = await fetch_token(c)
+        if t:
+            remaining_prices[c] = t["price_usd"]
+            remaining_mcaps[c] = t.get("mc")
     stats = portfolio_stats(user, remaining_prices)
     ts = datetime.fromtimestamp(trade["timestamp"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     pnl_sol = trade["pnl_sol"]
-    emoji = "🟥"
+    emoji = "🟩" if pnl_sol >= 0 else "🟥"
     text = (
         f"{emoji} *SELL EXECUTED*\n\n"
         f"Token: `${md_escape(token['symbol'])}` — {md_escape(token['name'])}\n"
         f"Quantity Sold: `{trade['quantity']:,.2f}`\n"
         f"Exit Price: `{fmt_price(trade['price'])}`\n"
+        f"Exit MCAP: `{fmt_num(trade.get('exit_mcap'))}`\n"
         f"PnL: {fmt_pct(trade['pnl_pct'])} (`{'+' if pnl_sol>=0 else ''}{fmt_sol(pnl_sol)} SOL`)\n\n"
         f"👛 Remaining Balance: `{fmt_sol(user['balance'])} SOL`\n"
         f"📊 Portfolio Value: `{fmt_sol(stats['portfolio_value'])} SOL`\n"
@@ -1445,12 +1682,19 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query,
                 f"{BRAND}\n\n🔍 *Track a Token*\n\n"
                 "Paste any Solana token contract address in the chat and I'll pull up "
-                "live price, liquidity, market cap and volume instantly.",
+                "live price, market cap, volume and metadata instantly.\n\n"
+                "_Data sourced from Helius API (primary) with DexScreener fallback._",
                 reply_markup=kb_back("home"),
             )
 
         elif data.startswith("tok:"):
-            await show_token_screen(query, context, data.split(":", 1)[1])
+            ca = data.split(":", 1)[1]
+            await show_token_screen(query, context, ca)
+
+        elif data.startswith("refpos:"):
+            ca = data.split(":", 1)[1]
+            # Refresh just this position and go back to positions
+            await show_positions_screen(query, context, 0)
 
         elif data.startswith("buy:"):
             ca = data.split(":", 1)[1]
@@ -1478,6 +1722,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif data.startswith("shr:"):
             await do_share(query, context, data.split(":", 1)[1])
+
+        elif data.startswith("copy:"):
+            ca = data.split(":", 1)[1]
+            await query.answer(f"📋 Copied: {ca}", show_alert=False)
+            # Copy to clipboard via Telegram's copy feature
+            await safe_edit(
+                query,
+                f"{BRAND}\n\n📋 *Contract Address Copied*\n\n"
+                f"`{ca}`\n\n_Paste this anywhere to share or track._",
+                reply_markup=kb_back("home"),
+            )
 
         elif data == "set_balance":
             context.user_data["awaiting"] = "set_balance"
@@ -1601,6 +1856,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Token: `${md_escape(token['symbol'])}` — {md_escape(token['name'])}\n"
                 f"Quantity: `{trade['quantity']:,.2f}`\n"
                 f"Entry Price: `{fmt_price(trade['price'])}`\n"
+                f"Entry MCAP: `{fmt_num(trade.get('mcap'))}`\n"
                 f"Invested: `{fmt_sol(trade['sol_amount'])} SOL`\n\n"
                 f"👛 Remaining Balance: `{fmt_sol(user['balance'])} SOL`\n"
                 f"📊 Portfolio Value: `{fmt_sol(stats['portfolio_value'])} SOL`\n"
@@ -1627,13 +1883,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = await fetch_token(ca)
     if not token:
         await update.message.reply_text(
-            f"⚠️ Could not find market data for:\n`{ca}`\n\nIt may be invalid or not yet indexed by DexScreener.",
+            f"⚠️ Could not find market data for:\n`{ca}`\n\n"
+            "It may be invalid, not indexed by Helius, or not found on DexScreener.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     save_db(db)
     context.user_data["last_ca"] = ca
+    
+    # Send logo if available
+    if token.get("logo_url"):
+        await send_token_logo(context, update.message.chat_id, token)
+    
     msg_text = await build_token_text(ca, token, user)
     has_pos = ca in user["positions"]
     await update.message.reply_text(
@@ -1656,18 +1918,10 @@ def main():
             "BOT_TOKEN is not set. Copy .env.example to .env and add your Telegram bot token."
         )
 
-    # -------------------------------------------------------------------
+    if not HELIUS_API_KEY:
+        logger.warning("HELIUS_API_KEY not set. Will rely on DexScreener fallback.")
+
     # Python 3.14 compatibility shim
-    # -------------------------------------------------------------------
-    # python-telegram-bot's synchronous Application.run_polling() calls
-    # asyncio.get_event_loop() internally. Up through Python 3.13 that
-    # call would silently create a new event loop the first time it was
-    # invoked on the main thread. Python 3.14 removed that implicit
-    # creation entirely, so the same call now raises:
-    #   RuntimeError: There is no current event loop in thread 'MainThread'.
-    # We work around this by explicitly creating and setting a loop
-    # ourselves before PTB ever asks for one — this keeps bot.py working
-    # unchanged on Python 3.9 through 3.14+.
     try:
         asyncio.get_event_loop()
     except RuntimeError:
@@ -1681,6 +1935,7 @@ def main():
     app.add_error_handler(on_error)
 
     logger.info("Pulse Bot starting (long-polling)...")
+    logger.info("Data sources: Helius (primary) + DexScreener (fallback)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
