@@ -1,0 +1,20 @@
+services:
+  - type: worker
+    name: pulse-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      # Set your real token here in the Render dashboard (Environment tab).
+      # This takes priority over the hardcoded fallback in bot.py.
+      - key: BOT_TOKEN
+        sync: false
+      - key: DB_PATH
+        value: db.json
+    # Optional: attach a persistent disk so db.json (demo wallets, trade
+    # history) survives restarts/redeploys. Uncomment to enable:
+    # disk:
+    #   name: pulse-bot-data
+    #   mountPath: /opt/render/project/src/data
+    #   sizeGB: 1

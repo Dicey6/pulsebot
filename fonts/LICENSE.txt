@@ -1,0 +1,9 @@
+DejaVu Fonts (DejaVuSans, DejaVuSans-Bold, DejaVuSansMono, DejaVuSansMono-Bold)
+
+These fonts are bundled so the PNL card renders identically regardless of
+what fonts are installed on the deployment host (e.g. Render).
+
+DejaVu fonts are a derivative of the Bitstream Vera fonts and are released
+under a free, permissive license that allows redistribution, with or
+without modification. Full license text:
+https://dejavu-fonts.github.io/License.html
