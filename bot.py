@@ -29,6 +29,7 @@ Run:
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -1654,6 +1655,23 @@ def main():
         raise SystemExit(
             "BOT_TOKEN is not set. Copy .env.example to .env and add your Telegram bot token."
         )
+
+    # -------------------------------------------------------------------
+    # Python 3.14 compatibility shim
+    # -------------------------------------------------------------------
+    # python-telegram-bot's synchronous Application.run_polling() calls
+    # asyncio.get_event_loop() internally. Up through Python 3.13 that
+    # call would silently create a new event loop the first time it was
+    # invoked on the main thread. Python 3.14 removed that implicit
+    # creation entirely, so the same call now raises:
+    #   RuntimeError: There is no current event loop in thread 'MainThread'.
+    # We work around this by explicitly creating and setting a loop
+    # ourselves before PTB ever asks for one — this keeps bot.py working
+    # unchanged on Python 3.9 through 3.14+.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = Application.builder().token(BOT_TOKEN).build()
 
