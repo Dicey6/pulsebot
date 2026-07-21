@@ -100,8 +100,10 @@ POSITIONS_PER_PAGE = 3
 HISTORY_PER_PAGE = 6
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
-HELIUS_PRICE_URL = "https://api.helius.xyz/v0/token-price"
-HELIUS_DAS_URL = "https://api.helius.xyz/v0/assets"
+# Jupiter Price API v2 — free, no key, reliable Solana price source
+JUPITER_PRICE_URL = "https://api.jup.ag/price/v2"
+# Helius DAS JSON-RPC endpoint (getAsset) — metadata only
+HELIUS_RPC_URL = "https://mainnet.helius-rpc.com/"
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
 SOL_ADDRESS_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
@@ -319,35 +321,35 @@ _cache_ttl = 30  # seconds
 
 
 async def fetch_token_helius(contract_address: str) -> dict[str, Any] | None:
-    """Fetch token data from Helius API (price + metadata)."""
+    """Fetch token price from Jupiter Price API v2, metadata from Helius DAS."""
+    # ── Price via Jupiter Price API v2 (free, no key required) ──────────────
     try:
-        # Get price data
         async with httpx.AsyncClient(timeout=10.0) as client:
-            price_url = f"{HELIUS_PRICE_URL}?api-key={HELIUS_API_KEY}&mint={contract_address}"
-            resp = await client.get(price_url, headers={"Accept": "application/json"})
+            resp = await client.get(
+                JUPITER_PRICE_URL,
+                params={"ids": contract_address},
+                headers={"Accept": "application/json"},
+            )
             resp.raise_for_status()
-            price_data = resp.json()
-    except (httpx.HTTPError, ValueError, KeyError) as e:
-        logger.warning("Helius price fetch failed for %s: %s", contract_address, e)
+            jdata = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning("Jupiter price fetch failed for %s: %s", contract_address, e)
         return None
 
-    # Parse price response
-    price_info = None
-    if price_data.get("data") and len(price_data["data"]) > 0:
-        price_info = price_data["data"][0]
-
-    if not price_info:
+    token_price_info = (jdata.get("data") or {}).get(contract_address)
+    if not token_price_info:
+        logger.warning("Jupiter returned no price for %s", contract_address)
         return None
 
     try:
-        price_usd = float(price_info.get("price", 0))
-        mc = float(price_info.get("marketCap", 0))
-        volume_24h = float(price_info.get("volume24h", 0))
-        change_24h = float(price_info.get("priceChange24h", 0))
+        price_usd = float(token_price_info.get("price") or 0)
     except (TypeError, ValueError):
         return None
 
-    # Get metadata from DAS
+    if not price_usd:
+        return None
+
+    # ── Metadata via Helius DAS getAsset (JSON-RPC POST) ────────────────────
     name, symbol, decimals, supply, created_at, logo_url = await fetch_token_metadata_helius(contract_address)
 
     return {
@@ -355,62 +357,67 @@ async def fetch_token_helius(contract_address: str) -> dict[str, Any] | None:
         "name": name or "Unknown",
         "symbol": symbol or "???",
         "price_usd": price_usd,
-        "mc": mc,
-        "volume_24h": volume_24h,
-        "change_h24": change_24h,
-        "liquidity_usd": None,  # Helius doesn't provide this
+        "mc": None,           # Jupiter v2 doesn't include mcap; DexScreener fallback has it
+        "volume_24h": None,
+        "change_h24": None,
+        "liquidity_usd": None,
         "decimals": decimals,
         "total_supply": supply,
         "created_at": created_at,
         "logo_url": logo_url,
-        "source": "helius",
+        "source": "jupiter",
         "fetched_at": now_ts(),
     }
 
 
 async def fetch_token_metadata_helius(contract_address: str) -> tuple[Optional[str], Optional[str], Optional[int], Optional[float], Optional[float], Optional[str]]:
-    """Fetch token metadata from Helius DAS API."""
+    """Fetch token metadata from Helius DAS API via JSON-RPC POST (getAsset)."""
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            url = f"{HELIUS_DAS_URL}?api-key={HELIUS_API_KEY}&ids={contract_address}"
-            resp = await client.get(url, headers={"Accept": "application/json"})
+            url = f"{HELIUS_RPC_URL}?api-key={HELIUS_API_KEY}"
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "pulsebot-getasset",
+                "method": "getAsset",
+                "params": {"id": contract_address},
+            }
+            resp = await client.post(url, json=payload, headers={"Content-Type": "application/json"})
             resp.raise_for_status()
             data = resp.json()
     except (httpx.HTTPError, ValueError) as e:
         logger.warning("Helius DAS fetch failed for %s: %s", contract_address, e)
         return None, None, None, None, None, None
 
-    if not data.get("data") or len(data["data"]) == 0:
+    asset = data.get("result")
+    if not asset:
         return None, None, None, None, None, None
 
-    asset = data["data"][0]
     content = asset.get("content", {})
     metadata = content.get("metadata", {})
-    
+
     name = metadata.get("name")
     symbol = metadata.get("symbol")
-    
-    # Get decimals from token_info
+
+    # Get decimals and supply from token_info
     token_info = asset.get("token_info", {})
     decimals = token_info.get("decimals")
     supply = token_info.get("supply")
-    
-    # Created at - try to parse from mint extensions or use current time
+
+    # Created at
     created_at = None
-    # Try to get from various possible fields
     if asset.get("created_at"):
         try:
             created_at = float(asset["created_at"])
         except (TypeError, ValueError):
             pass
-    
+
     # Logo URL
     logo_url = None
     if content.get("links", {}).get("image"):
         logo_url = content["links"]["image"]
     elif metadata.get("image"):
         logo_url = metadata["image"]
-    
+
     return name, symbol, decimals, supply, created_at, logo_url
 
 
@@ -471,40 +478,72 @@ async def fetch_token(contract_address: str, force_refresh: bool = False) -> dic
         if now_ts() - cached.get("fetched_at", 0) < _cache_ttl:
             return cached
     
-    # Try Helius
-    token = await fetch_token_helius(contract_address)
-    if token:
+    # Try Jupiter (price) + Helius DAS (metadata), enrich with DexScreener market data
+    jupiter_token, dex_token = await asyncio.gather(
+        fetch_token_helius(contract_address),
+        fetch_token_dexscreener(contract_address),
+        return_exceptions=True,
+    )
+    if isinstance(jupiter_token, Exception):
+        jupiter_token = None
+    if isinstance(dex_token, Exception):
+        dex_token = None
+
+    if jupiter_token and dex_token:
+        # Merge: Jupiter has the most accurate price; DexScreener supplies mc/volume/liquidity/change
+        token = {**dex_token, **jupiter_token}
+        token["mc"] = dex_token.get("mc") or jupiter_token.get("mc")
+        token["volume_24h"] = dex_token.get("volume_24h")
+        token["change_h24"] = dex_token.get("change_h24")
+        token["liquidity_usd"] = dex_token.get("liquidity_usd")
+        token["source"] = "jupiter+dexscreener"
         _token_cache[cache_key] = token
         return token
-    
-    # Fallback to DexScreener
-    logger.info("Helius failed for %s, falling back to DexScreener", contract_address)
-    token = await fetch_token_dexscreener(contract_address)
-    if token:
-        _token_cache[cache_key] = token
-        return token
-    
+
+    if jupiter_token:
+        _token_cache[cache_key] = jupiter_token
+        return jupiter_token
+
+    if dex_token:
+        _token_cache[cache_key] = dex_token
+        return dex_token
+
     return None
 
 
 async def get_sol_price_usd() -> float:
-    """Cached SOL/USD price, refreshed every 60s."""
+    """Cached SOL/USD price, refreshed every 60s via Jupiter Price API."""
     if now_ts() - _sol_price_cache["ts"] < 60:
         return _sol_price_cache["price"]
-    
-    # Try Helius first
-    token = await fetch_token_helius(SOL_MINT)
-    if token and token["price_usd"]:
-        _sol_price_cache["price"] = token["price_usd"]
-        _sol_price_cache["ts"] = now_ts()
-        return _sol_price_cache["price"]
-    
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                JUPITER_PRICE_URL,
+                params={"ids": SOL_MINT},
+                headers={"Accept": "application/json"},
+            )
+            resp.raise_for_status()
+            jdata = resp.json()
+        price_info = (jdata.get("data") or {}).get(SOL_MINT)
+        if price_info:
+            price = float(price_info.get("price") or 0)
+            if price:
+                _sol_price_cache["price"] = price
+                _sol_price_cache["ts"] = now_ts()
+                return _sol_price_cache["price"]
+    except (httpx.HTTPError, ValueError, TypeError) as e:
+        logger.warning("Jupiter SOL price fetch failed: %s", e)
+
     # Fallback to DexScreener
-    token = await fetch_token_dexscreener(SOL_MINT)
-    if token and token["price_usd"]:
-        _sol_price_cache["price"] = token["price_usd"]
-        _sol_price_cache["ts"] = now_ts()
-    
+    try:
+        token = await fetch_token_dexscreener(SOL_MINT)
+        if token and token["price_usd"]:
+            _sol_price_cache["price"] = token["price_usd"]
+            _sol_price_cache["ts"] = now_ts()
+    except Exception as e:
+        logger.warning("DexScreener SOL price fetch failed: %s", e)
+
     return _sol_price_cache["price"]
 
 
