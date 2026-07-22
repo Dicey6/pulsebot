@@ -17,7 +17,7 @@ services:
       # that python-telegram-bot 21.x is not yet tested against — pin to
       # a known-good version instead of relying on Render's default.
       - key: PYTHON_VERSION
-        value: 3.12.7
+        value: 3.11.9
     # Optional: attach a persistent disk so db.json (demo wallets, trade
     # history) survives restarts/redeploys. Uncomment to enable:
     # disk:
