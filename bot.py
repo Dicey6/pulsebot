@@ -836,6 +836,10 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 
 def main():
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
