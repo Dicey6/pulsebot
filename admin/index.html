@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pulse Bot — Admin</title>
+<style>
+:root {
+  --bg:#07091a; --surf:#0e1130; --surf2:#161940; --border:#252850;
+  --purple:#7c3aed; --purpleL:#9d6af5; --green:#00d4aa; --red:#ff4444;
+  --white:#f0f0ff; --grey:#8888aa; --gold:#ffc840;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--white);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh}
+
+/* Login */
+#login{display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:16px;padding:48px 40px;width:380px;text-align:center}
+.card .logo{font-size:52px;margin-bottom:10px}
+.card h1{font-size:22px;margin-bottom:4px}
+.card p{color:var(--grey);font-size:13px;margin-bottom:28px}
+.inp{width:100%;padding:12px 16px;background:var(--surf2);border:1px solid var(--border);
+     border-radius:8px;color:var(--white);font-size:14px;margin-bottom:12px;outline:none;transition:border .15s}
+.inp:focus{border-color:var(--purple)}
+#lerr{color:var(--red);font-size:13px;min-height:18px;margin-bottom:10px}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 18px;border-radius:8px;
+     border:none;cursor:pointer;font-size:13px;font-weight:600;transition:opacity .15s}
+.btn:hover{opacity:.82}
+.btn-p{background:var(--purple);color:#fff}
+.btn-g{background:#0a3d30;color:var(--green)}
+.btn-r{background:#3a0f0f;color:var(--red)}
+.btn-ghost{background:var(--surf2);color:var(--grey);border:1px solid var(--border)}
+.full{width:100%;justify-content:center}
+
+/* App */
+#app{display:none}
+.bar{background:var(--surf);border-bottom:1px solid var(--border);padding:0 28px;
+     height:60px;display:flex;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px}
+.dot{width:9px;height:9px;background:var(--green);border-radius:50%}
+.bar-actions{display:flex;gap:8px}
+.main{max-width:1120px;margin:0 auto;padding:28px 20px}
+
+/* Stats */
+.stats{display:flex;gap:14px;margin-bottom:24px;flex-wrap:wrap}
+.stat{flex:1;min-width:140px;background:var(--surf);border:1px solid var(--border);
+      border-radius:12px;padding:18px 20px}
+.stat .lbl{font-size:11px;color:var(--grey);text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px}
+.stat .val{font-size:28px;font-weight:700}
+
+/* Sections */
+.sec{background:var(--surf);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;overflow:hidden}
+.sec-hd{padding:16px 22px;border-bottom:1px solid var(--border);
+         display:flex;align-items:center;justify-content:space-between}
+.sec-hd h2{font-size:15px}
+
+/* Table */
+table{width:100%;border-collapse:collapse}
+th{padding:11px 18px;font-size:11px;color:var(--grey);text-transform:uppercase;
+   letter-spacing:.07em;text-align:left;border-bottom:1px solid var(--border)}
+td{padding:13px 18px;font-size:13px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surf2)}
+.mono{font-family:'Courier New',monospace;font-size:12px;color:var(--grey)}
+.badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600}
+.bg{background:#0a3d30;color:var(--green)}
+.br{background:var(--surf2);color:var(--grey)}
+.bp{background:#2d1660;color:var(--purpleL)}
+.empty{padding:36px;text-align:center;color:var(--grey);font-size:14px}
+.actions{display:flex;gap:6px}
+
+/* Modal */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+          z-index:100;align-items:center;justify-content:center}
+.overlay.open{display:flex}
+.modal{background:var(--surf);border:1px solid var(--border);border-radius:16px;
+       padding:30px;width:420px;max-width:94vw}
+.modal h3{font-size:18px;margin-bottom:18px}
+.modal label{display:block;font-size:12px;color:var(--grey);margin:14px 0 5px}
+.modal-actions{display:flex;gap:10px;margin-top:22px}
+.modal-actions .btn{flex:1;justify-content:center}
+
+/* Toast */
+#toast{position:fixed;bottom:28px;right:28px;background:var(--surf);border:1px solid var(--border);
+       border-radius:10px;padding:13px 18px;font-size:13px;display:none;z-index:200;
+       box-shadow:0 6px 28px rgba(0,0,0,.45)}
+#toast.ok{border-color:var(--green);color:var(--green)}
+#toast.err{border-color:var(--red);color:var(--red)}
+</style>
+</head>
+<body>
+
+<!-- Login -->
+<div id="login">
+  <div class="card">
+    <div class="logo">⚡</div>
+    <h1>Pulse Bot Admin</h1>
+    <p>Enter credentials to access the dashboard</p>
+    <input class="inp" id="sb-url"  type="text"     placeholder="Supabase Project URL" autocomplete="off" />
+    <input class="inp" id="sb-key"  type="text"     placeholder="Service Role Key"    autocomplete="off" />
+    <input class="inp" id="pw"      type="password" placeholder="Admin password"       autocomplete="off" />
+    <div id="lerr"></div>
+    <button class="btn btn-p full" onclick="login()">Sign In →</button>
+  </div>
+</div>
+
+<!-- App -->
+<div id="app">
+  <div class="bar">
+    <div class="brand"><span class="dot"></span> Pulse Bot Admin</div>
+    <div class="bar-actions">
+      <button class="btn btn-g" onclick="openInvite()">＋ Create Invite</button>
+      <button class="btn btn-ghost" onclick="load()">↻ Refresh</button>
+      <button class="btn btn-ghost" onclick="logout()">Sign Out</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="stats">
+      <div class="stat"><div class="lbl">Total Users</div><div class="val" id="s-users">—</div></div>
+      <div class="stat"><div class="lbl">Invite Codes</div><div class="val" id="s-codes">—</div></div>
+      <div class="stat"><div class="lbl">Used Codes</div><div class="val" id="s-used">—</div></div>
+      <div class="stat"><div class="lbl">Total Trades</div><div class="val" id="s-trades">—</div></div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd"><h2>Users</h2></div>
+      <div id="users-wrap"><div class="empty">Loading…</div></div>
+    </div>
+
+    <div class="sec">
+      <div class="sec-hd"><h2>Invite Codes</h2></div>
+      <div id="codes-wrap"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Invite modal -->
+<div class="overlay" id="m-invite">
+  <div class="modal">
+    <h3>Create Invite Code</h3>
+    <label>Label <span style="color:var(--grey)">(optional)</span></label>
+    <input class="inp" id="i-label" type="text" placeholder="e.g. VIP, Beta tester…" />
+    <label>Custom code <span style="color:var(--grey)">(blank = auto-generate)</span></label>
+    <input class="inp" id="i-code"  type="text" placeholder="e.g. PULSE2025" />
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeM('m-invite')">Cancel</button>
+      <button class="btn btn-p"     onclick="createInvite()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Balance modal -->
+<div class="overlay" id="m-balance">
+  <div class="modal">
+    <h3>Adjust Balance</h3>
+    <input type="hidden" id="b-uid" />
+    <p id="b-info" style="color:var(--grey);font-size:13px;margin-bottom:4px"></p>
+    <label>New balance (SOL)</label>
+    <input class="inp" id="b-amount" type="number" step="0.01" min="0" placeholder="e.g. 10.5" />
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeM('m-balance')">Cancel</button>
+      <button class="btn btn-p"     onclick="saveBalance()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const PW = 'Peaklabs@2006';
+let URL = '', KEY = '';
+
+function login() {
+  const url = document.getElementById('sb-url').value.trim();
+  const key = document.getElementById('sb-key').value.trim();
+  const pw  = document.getElementById('pw').value;
+  const err = document.getElementById('lerr');
+  if (pw !== PW)       { err.textContent = 'Wrong password.'; return; }
+  if (!url || !key)    { err.textContent = 'URL and key are required.'; return; }
+  URL = url.replace(/\/$/, ''); KEY = key;
+  sessionStorage.setItem('u', URL); sessionStorage.setItem('k', KEY);
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('app').style.display   = 'block';
+  load();
+}
+function logout() { sessionStorage.clear(); location.reload(); }
+
+window.onload = () => {
+  const u = sessionStorage.getItem('u'), k = sessionStorage.getItem('k');
+  if (u && k) {
+    URL = u; KEY = k;
+    document.getElementById('sb-url').value = u;
+    document.getElementById('sb-key').value = k;
+    document.getElementById('pw').value      = PW;
+    document.getElementById('login').style.display = 'none';
+    document.getElementById('app').style.display   = 'block';
+    load();
+  }
+};
+
+// ── Supabase REST ─────────────────────────────────────────────────────────────
+const H = () => ({ apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Accept: 'application/json' });
+async function GET(t, q = '')        { const r = await fetch(`${URL}/rest/v1/${t}?${q}`, { headers: H() }); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+async function POST(t, b)             { const r = await fetch(`${URL}/rest/v1/${t}`, { method:'POST',   headers:{...H(), Prefer:'return=representation'}, body:JSON.stringify(b) }); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+async function PATCH(t, q, b)        { const r = await fetch(`${URL}/rest/v1/${t}?${q}`, { method:'PATCH',  headers:{...H(), Prefer:'return=representation'}, body:JSON.stringify(b) }); if (!r.ok) throw new Error(await r.text()); return r.json(); }
+async function DELETE(t, q)          { const r = await fetch(`${URL}/rest/v1/${t}?${q}`, { method:'DELETE', headers: H() }); if (!r.ok) throw new Error(await r.text()); }
+
+// ── Load ──────────────────────────────────────────────────────────────────────
+async function load() {
+  try {
+    const [users, codes, trades] = await Promise.all([
+      GET('users', 'order=created_at.desc'),
+      GET('invite_codes', 'order=created_at.desc'),
+      GET('trades', 'select=id&limit=9999'),
+    ]);
+    document.getElementById('s-users').textContent  = users.length;
+    document.getElementById('s-codes').textContent  = codes.length;
+    document.getElementById('s-used').textContent   = codes.filter(c=>c.is_used).length;
+    document.getElementById('s-trades').textContent = trades.length;
+    renderUsers(users); renderCodes(codes);
+  } catch(e) { toast('Error: ' + e.message, 'err'); }
+}
+
+function renderUsers(users) {
+  const el = document.getElementById('users-wrap');
+  if (!users.length) { el.innerHTML = '<div class="empty">No users yet.</div>'; return; }
+  el.innerHTML = `<table><thead><tr>
+    <th>User</th><th>Telegram ID</th><th>Balance</th><th>Realized P&L</th><th>Joined</th><th>Actions</th>
+  </tr></thead><tbody>${users.map(u=>`<tr>
+    <td><strong>${e(u.first_name||'')} ${u.username?`<span style="color:var(--grey)">@${e(u.username)}</span>`:''}</strong></td>
+    <td class="mono">${u.id}</td>
+    <td><strong>${(u.balance_sol||0).toFixed(4)} SOL</strong></td>
+    <td style="color:${(u.realized_pnl_sol||0)>=0?'var(--green)':'var(--red)'}">
+      ${(u.realized_pnl_sol||0)>=0?'+':''}${(u.realized_pnl_sol||0).toFixed(4)} SOL
+    </td>
+    <td class="mono">${u.created_at?new Date(u.created_at*1000).toLocaleDateString():'—'}</td>
+    <td><div class="actions">
+      <button class="btn btn-ghost" style="padding:6px 10px;font-size:12px"
+        onclick="openBalance(${u.id},'${e(u.first_name||'')}',${u.balance_sol||0})">💰 Balance</button>
+      <button class="btn btn-r" style="padding:6px 10px;font-size:12px"
+        onclick="delUser(${u.id},'${e(u.first_name||'')}')">Delete</button>
+    </div></td>
+  </tr>`).join('')}</tbody></table>`;
+}
+
+function renderCodes(codes) {
+  const el = document.getElementById('codes-wrap');
+  if (!codes.length) { el.innerHTML = '<div class="empty">No invite codes yet. Create one above.</div>'; return; }
+  el.innerHTML = `<table><thead><tr>
+    <th>Code</th><th>Label</th><th>Status</th><th>Used By</th><th>Actions</th>
+  </tr></thead><tbody>${codes.map(c=>`<tr>
+    <td><strong class="mono" style="color:var(--white)">${e(c.code)}</strong></td>
+    <td>${e(c.label||'—')}</td>
+    <td>${c.is_used?'<span class="badge br">Used</span>':'<span class="badge bg">Active</span>'}</td>
+    <td class="mono">${c.used_by||'—'}</td>
+    <td>${!c.is_used?`<button class="btn btn-r" style="padding:6px 10px;font-size:12px"
+      onclick="revokeCode('${e(c.code)}')">Revoke</button>`:''}</td>
+  </tr>`).join('')}</tbody></table>`;
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+function openInvite() {
+  document.getElementById('i-label').value = '';
+  document.getElementById('i-code').value  = '';
+  openM('m-invite');
+}
+async function createInvite() {
+  const label = document.getElementById('i-label').value.trim();
+  let code    = document.getElementById('i-code').value.trim().toUpperCase();
+  if (!code) code = 'PULSE-' + Math.random().toString(36).slice(2,8).toUpperCase();
+  try {
+    await POST('invite_codes', { code, label: label||null, is_used:false, created_at: Date.now()/1000 });
+    closeM('m-invite');
+    toast(`Invite code created: ${code}`, 'ok');
+    load();
+  } catch(err) { toast('Error: ' + err.message, 'err'); }
+}
+async function revokeCode(code) {
+  if (!confirm(`Revoke invite code ${code}?`)) return;
+  try { await DELETE('invite_codes', `code=eq.${encodeURIComponent(code)}`); toast('Code revoked.','ok'); load(); }
+  catch(err) { toast('Error: ' + err.message, 'err'); }
+}
+function openBalance(id, name, bal) {
+  document.getElementById('b-uid').value    = id;
+  document.getElementById('b-info').textContent = `${name} (${id})  ·  Current: ${bal.toFixed(4)} SOL`;
+  document.getElementById('b-amount').value = bal.toFixed(4);
+  openM('m-balance');
+}
+async function saveBalance() {
+  const id  = document.getElementById('b-uid').value;
+  const bal = parseFloat(document.getElementById('b-amount').value);
+  if (isNaN(bal)||bal<0) { toast('Invalid balance.','err'); return; }
+  try {
+    await PATCH('users', `id=eq.${id}`, { balance_sol: bal });
+    closeM('m-balance'); toast('Balance updated.','ok'); load();
+  } catch(err) { toast('Error: ' + err.message, 'err'); }
+}
+async function delUser(id, name) {
+  if (!confirm(`Delete user ${name} (${id})? This is permanent.`)) return;
+  try { await DELETE('users', `id=eq.${id}`); toast('User deleted.','ok'); load(); }
+  catch(err) { toast('Error: ' + err.message, 'err'); }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function openM(id)  { document.getElementById(id).classList.add('open'); }
+function closeM(id) { document.getElementById(id).classList.remove('open'); }
+function e(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;'); }
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.className = type; el.style.display = 'block';
+  clearTimeout(el._t); el._t = setTimeout(()=>el.style.display='none', 3500);
+}
+document.querySelectorAll('.overlay').forEach(o => o.addEventListener('click', ev => { if (ev.target===o) o.classList.remove('open'); }));
+document.addEventListener('keydown', ev => {
+  if (ev.key==='Enter' && document.getElementById('login').style.display!=='none') login();
+  if (ev.key==='Escape') document.querySelectorAll('.overlay.open').forEach(o=>o.classList.remove('open'));
+});
+</script>
+</body>
+</html>
