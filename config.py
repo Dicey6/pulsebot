@@ -9,8 +9,8 @@ BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8638344989:AAH3bfBni5GN3oWUBoVerKIMzND0
 BOT_USERNAME: str = "@pulsesolanabot"
 
 # ── Supabase ──────────────────────────────────────────────────────────────────
-SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "https://nxinepokzdxzkbkcxwfy.supabase.co")
+SUPABASE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im54aW5lcG9remR4emtia2N4d2Z5Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MzAwNjIyNiwiZXhwIjoyMDk4NTgyMjI2fQ.Ajr3ugANvvhj-uaZjyEAo_BLx7W5tLdAGwsJAN2eBdk")
 
 # ── APIs ──────────────────────────────────────────────────────────────────────
 HELIUS_API_KEY: str = os.getenv("HELIUS_API_KEY", "d5381285-5b00-4ad2-9255-581b5e55e2cc")
