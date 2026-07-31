@@ -1,0 +1,29 @@
+services:
+  - type: worker
+    name: pulse-trading-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: FERNET_SECRET
+        sync: false
+      - key: DEXSCREENER_BASE_URL
+        value: https://api.dexscreener.com
+      - key: PUMPFUN_FRONTEND_API
+        value: https://frontend-api.pump.fun
+      - key: DEV_DONATION_WALLET
+        value: 6uz2L1XGVArpADTdC3P1DX7S9BrxfPtKYgHkcBJQs23v
+      - key: DEFAULT_STARTING_BALANCE_SOL
+        value: "5"
+      - key: FIXED_GAS_FEE_SOL
+        value: "0.0001"
+      - key: MAX_OPEN_POSITIONS
+        value: "4"
