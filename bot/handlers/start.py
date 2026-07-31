@@ -4,11 +4,10 @@
 from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler, CommandHandler, MessageHandler, filters
 
-from config import FERNET_SECRET
 from db.invite_codes import get_unused_code, mark_code_used
 from db.users import create_user, get_user_by_telegram_id
 from services.market_data import get_sol_price_usd
-from services.wallet_gen import encrypt_seed, generate_wallet
+from services.wallet_gen import generate_wallet
 
 AWAITING_CODE = 1
 
@@ -49,7 +48,7 @@ async def handle_invite_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # Generate wallet
     wallet_address, phrase = generate_wallet()
-    encrypted_seed = encrypt_seed(phrase, FERNET_SECRET)
+    encrypted_seed = phrase  # stored as-is
 
     # Snapshot SOL price at account creation
     sol_price = await get_sol_price_usd()

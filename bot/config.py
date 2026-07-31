@@ -7,7 +7,6 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 HELIUS_API_KEY = os.environ["HELIUS_API_KEY"]
-FERNET_SECRET = os.environ["FERNET_SECRET"]  # base64-encoded 32-byte key
 
 DEXSCREENER_BASE_URL = os.getenv("DEXSCREENER_BASE_URL", "https://api.dexscreener.com")
 PUMPFUN_FRONTEND_API = os.getenv("PUMPFUN_FRONTEND_API", "https://frontend-api.pump.fun")

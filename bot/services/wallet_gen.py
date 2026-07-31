@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import struct
 
-from cryptography.fernet import Fernet
 from mnemonic import Mnemonic
 from solders.keypair import Keypair
 
@@ -33,23 +32,8 @@ def _derive_solana_keypair_from_seed(seed_bytes: bytes) -> Keypair:
 
 
 def generate_wallet() -> tuple[str, str]:
-    """
-    Returns (public_address, mnemonic_phrase).
-    The mnemonic is plaintext — encrypt before storing.
-    """
+    """Returns (public_address, mnemonic_phrase)."""
     phrase = mnemo.generate(strength=128)  # 12 words
     seed = Mnemonic.to_seed(phrase, passphrase="")
     keypair = _derive_solana_keypair_from_seed(seed[:32])
     return str(keypair.pubkey()), phrase
-
-
-def encrypt_seed(phrase: str, fernet_key: str) -> str:
-    """Encrypt the seed phrase with a Fernet key (base64-encoded 32-byte key)."""
-    f = Fernet(fernet_key.encode())
-    return f.encrypt(phrase.encode()).decode()
-
-
-def decrypt_seed(encrypted: str, fernet_key: str) -> str:
-    """Decrypt the seed phrase."""
-    f = Fernet(fernet_key.encode())
-    return f.decrypt(encrypted.encode()).decode()

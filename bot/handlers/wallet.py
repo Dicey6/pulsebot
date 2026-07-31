@@ -4,10 +4,9 @@ import asyncio
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import CallbackQueryHandler, ContextTypes
 
-from config import DEV_DONATION_WALLET, FERNET_SECRET
+from config import DEV_DONATION_WALLET
 from db.users import get_user_by_telegram_id
 from services.market_data import get_sol_price_usd
-from services.wallet_gen import decrypt_seed
 
 
 async def wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -65,7 +64,7 @@ async def wallet_export_reveal_callback(update: Update, context: ContextTypes.DE
     if not user:
         return
 
-    phrase = decrypt_seed(user["wallet_encrypted_seed"], FERNET_SECRET)
+    phrase = user["wallet_encrypted_seed"]  # stored as plaintext
 
     msg = await update.callback_query.message.reply_text(
         f"🔑 *Your Seed Phrase*\n\n`{phrase}`\n\n"
